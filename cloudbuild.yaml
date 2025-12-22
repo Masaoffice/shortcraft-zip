@@ -6,7 +6,6 @@
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
 
 \f0\fs24 \cf0 steps:\
-  # 1. Docker\uc0\u12452 \u12513 \u12540 \u12472 \u12398 \u12499 \u12523 \u12489 \
   - name: 'gcr.io/cloud-builders/docker'\
     args:\
       - build\
@@ -14,13 +13,11 @@
       - 'gcr.io/$PROJECT_ID/shortcraft-zip:$COMMIT_SHA'\
       - '.'\
 \
-  # 2. Container Registry (\uc0\u12414 \u12383 \u12399 Artifact Registry) \u12408 \u12503 \u12483 \u12471 \u12517 \
   - name: 'gcr.io/cloud-builders/docker'\
     args:\
       - push\
       - 'gcr.io/$PROJECT_ID/shortcraft-zip:$COMMIT_SHA'\
 \
-  # 3. Cloud Run \uc0\u12408 \u12487 \u12503 \u12525 \u12452 \
   - name: 'gcr.io/cloud-builders/gcloud'\
     args:\
       - run\
@@ -32,8 +29,5 @@
       - 'asia-northeast1'\
       - '--platform'\
       - 'managed'\
-      - '--allow-unauthenticated' # \uc0\u26410 \u35469 \u35388 \u12450 \u12463 \u12475 \u12473 \u12434 \u35377 \u21487 \u65288 \u19968 \u33324 \u20844 \u38283 \u12377 \u12427 \u22580 \u21512 \u65289 \
-\
-# \uc0\u12499 \u12523 \u12489 \u23436 \u20102 \u24460 \u12395 \u12452 \u12513 \u12540 \u12472 \u24773 \u22577 \u12434 \u12525 \u12464 \u12395 \u27531 \u12377 \u12383 \u12417 \u12398 \u35373 \u23450 \u65288 \u12458 \u12503 \u12471 \u12519 \u12531 \u12391 \u12377 \u12364 \u25512 \u22888 \u65289 \
-images:\
-  - 'gcr.io/$PROJECT_ID/shortcraft-zip:$COMMIT_SHA'}
+      - '--allow-unauthenticated'\
+}
