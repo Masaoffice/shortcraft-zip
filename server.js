@@ -1,119 +1,147 @@
 import express from "express";
-import cors from "cors";
 import archiver from "archiver";
-import pLimit from "p-limit";
-import { Readable } from "stream";
+import cors from "cors";
+import { v4 as uuidv4 } from "uuid";
+import fs from "fs";
+import path from "path";
+import { createClient } from "@supabase/supabase-js";
+import dotenv from "dotenv";
 
+dotenv.config();
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const STORAGE_BUCKET_VIDEOS = process.env.STORAGE_BUCKET_VIDEOS || "videos";
+const STORAGE_BUCKET_TEMP = process.env.STORAGE_BUCKET_TEMP || "temp";
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
-const PORT = process.env.PORT || 8080;
 
-// ===== CORS =====
 app.use(
   cors({
-    origin: (_origin, cb) => cb(null, true),
-    methods: ["POST", "OPTIONS"],
+    origin: (origin, callback) => {
+      // localhost / 本番 / Cloud Run すべて許可
+      callback(null, true);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
-  })
+  }),
 );
+
+// preflight を明示的に許可
 app.options("*", cors());
+
 app.use(express.json());
 
-// ===== Utils =====
-const sanitize = (name) =>
-  name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+// 簡易ジョブ管理（本番はDB/Redis推奨）
+const jobs = new Map(); // jobId -> { status, url, error }
 
-const fetchWithTimeout = async (url, ms = 300_000) => {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
-};
-
-// ===== API =====
 app.post("/api/create-zip", async (req, res) => {
-  const { zip_name, files, options } = req.body || {};
-  if (!Array.isArray(files) || files.length === 0) {
-    return res.status(400).json({ status: "failed", reason: "no_files" });
+  const { videos, zipName } = req.body;
+  if (!videos || !Array.isArray(videos) || videos.length === 0) {
+    return res.status(400).json({ error: "Invalid videos list" });
   }
+  const jobId = uuidv4();
+  jobs.set(jobId, { status: "processing" });
+  processZipJob(jobId, videos, zipName).catch((err) => {
+    console.error(`Job ${jobId} failed:`, err);
+    jobs.set(jobId, { status: "failed", error: err.message });
+  });
+  res.json({ jobId });
+});
 
-  const zipName = sanitize(zip_name || "download.zip");
-  const allowPartial = options?.allowPartial !== false;
-  const parallel = Math.max(1, Math.min(options?.parallel || 4, 6));
+app.get("/api/zip-status/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
+});
 
-  console.log(`[zip] start name=${zipName} files=${files.length} parallel=${parallel}`);
+async function processZipJob(jobId, videos, zipName = "download.zip") {
+  const fileName = `zip_${jobId}.zip`;
+  const tmpPath = path.join("/tmp", fileName);
+  const output = fs.createWriteStream(tmpPath);
+  const archive = archiver("zip", { zlib: { level: 5 } });
 
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
-
-  const archive = archiver("zip", { zlib: { level: 6 } });
-  const limit = pLimit(parallel);
-  const failed = [];
-
-  archive.on("warning", (err) => {
-    console.warn("[zip] warning:", err.message);
+  const finalizePromise = new Promise((resolve, reject) => {
+    output.on("close", resolve);
+    archive.on("error", reject);
   });
 
-  archive.on("error", (err) => {
-    console.error("[zip] fatal:", err);
-    if (!res.headersSent) res.status(500);
-    res.end();
-  });
+  archive.pipe(output);
 
-  archive.pipe(res);
+  for (const video of videos) {
+    const name = video.fileName || path.basename(video.storagePath);
+    const maxRetry = 2;
+    let success = false;
 
-  res.on("close", () => {
-    if (!res.writableEnded) {
-      console.warn("[zip] aborted by client");
+    for (let attempt = 1; attempt <= maxRetry; attempt += 1) {
       try {
-        archive.abort();
-      } catch {}
-    }
-  });
+        const { data, error } = await supabase.storage
+          .from(STORAGE_BUCKET_VIDEOS)
+          .download(video.storagePath);
+        if (error) throw error;
 
-  await Promise.all(
-    files.map((f, idx) =>
-      limit(async () => {
-        const zipPath = sanitize(f.zip_path || `video_${idx + 1}.bin`);
-        const maxRetry = 2;
-        for (let attempt = 1; attempt <= maxRetry; attempt += 1) {
-          try {
-            console.log(`[zip] file start: ${zipPath} attempt=${attempt}/${maxRetry}`);
-            const r = await fetchWithTimeout(f.url);
-            if (!r.ok || !r.body) {
-              throw new Error(`fetch_failed_${r.status}`);
-            }
-
-            // Web Stream → Node Stream
-            const nodeStream = Readable.fromWeb(r.body);
-            archive.append(nodeStream, { name: zipPath });
-            return;
-          } catch (e) {
-            console.warn(`[zip] file error: ${zipPath} attempt=${attempt}`, e.message);
-            if (attempt === maxRetry) {
-              failed.push({ zip_path: zipPath, reason: e.message });
-              if (!allowPartial) throw e;
-            } else {
-              // 少し待ってからリトライ
-              await new Promise((res) => setTimeout(res, 500));
-            }
-          }
+        const buffer = Buffer.from(await data.arrayBuffer());
+        archive.append(buffer, { name });
+        success = true;
+        break;
+      } catch (err) {
+        if (attempt === maxRetry) {
+          archive.append(
+            `Error processing: ${video.storagePath}\n${err.message}`,
+            { name: `${name}.error.txt` },
+          );
+        } else {
+          // 少し待ってリトライ
+          await new Promise((res) => setTimeout(res, 500));
         }
-      })
-    )
-  );
+      }
+    }
+
+    if (!success) {
+      // 失敗した場合も処理続行（部分成功を許容）
+      continue;
+    }
+  }
 
   await archive.finalize();
-  console.log(
-    `[zip] done status=${failed.length ? "partial_failed" : "completed"} failed=${failed.length}`
-  );
-});
+  await finalizePromise;
 
-// ===== Health =====
-app.get("/health", (_, res) => res.status(200).send("ok"));
+  try {
+    const storagePath = `zips/${fileName}`;
+    const fileBuffer = fs.readFileSync(tmpPath);
+    const { error: uploadError } = await supabase.storage
+      .from(STORAGE_BUCKET_TEMP)
+      .upload(storagePath, fileBuffer, {
+        contentType: "application/zip",
+        upsert: true,
+      });
+    if (uploadError) throw uploadError;
 
+    const { data: signed, error: signError } = await supabase.storage
+      .from(STORAGE_BUCKET_TEMP)
+      .createSignedUrl(storagePath, 3600);
+    if (signError) throw signError;
+
+    jobs.set(jobId, {
+      status: "completed",
+      url: signed.signedUrl,
+      name: zipName,
+    });
+  } catch (err) {
+    jobs.set(jobId, { status: "failed", error: err.message });
+  } finally {
+    if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+  }
+}
+
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`ZIP service listening on :${PORT}`);
+  console.log(`ZIP service running on port ${PORT}`);
 });
+
