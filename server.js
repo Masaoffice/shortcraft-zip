@@ -61,8 +61,13 @@ app.post("/api/create-zip", async (req, res) => {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
 
+  // 【重要】6GB超え対応のため forceZip64: true を追加
   // 動画ファイルなので圧縮なし(STORE)でCPU負荷を軽減
-  const archive = archiver("zip", { zlib: { level: 0 } });
+  const archive = archiver("zip", { 
+    zlib: { level: 0 },
+    forceZip64: true 
+  });
+  
   const failed = [];
   const tempFiles = []; // 作成した一時ファイルを追跡
   let isAborted = false;
@@ -145,15 +150,13 @@ app.post("/api/create-zip", async (req, res) => {
     res.destroy(err);
   } finally {
     // クリーンアップ: 記録された一時ファイルを全て削除
-    // archive.finalize() 後なので、archiverによる読み込みは完了しているはずだが、
-    // 万が一読み込み中であってもリクエスト終了時には消す必要がある。
     console.log(`[zip] cleaning up ${tempFiles.length} temp files...`);
     await Promise.all(
       tempFiles.map(async (p) => {
         try {
           await fs.promises.unlink(p);
         } catch (e) {
-          // 既に消えている、またはファイル作成前に失敗した場合は無視
+          // 無視
         }
       })
     );
