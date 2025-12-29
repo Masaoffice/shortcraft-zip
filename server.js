@@ -3,8 +3,7 @@ import cors from "cors";
 import archiver from "archiver";
 import pLimit from "p-limit";
 import { Agent, fetch } from "undici";
-import { PassThrough } from "stream";
-import { finished } from "stream/promises";
+import { Readable } from "stream";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -63,25 +62,18 @@ app.post("/api/create-zip", async (req, res) => {
       const f = files[i];
       await limit(async () => {
         const name = sanitize(f.zip_path || `file_${i + 1}`);
-        console.log(`[ZIP] fetch start`, name);
+        console.log("[ZIP] fetch start", name);
 
         const response = await fetch(f.url, { dispatcher: agent });
         if (!response.ok || !response.body) {
           throw new Error(`fetch_failed_${name}`);
         }
 
-        let bytes = 0;
-        response.body.on("data", (chunk) => {
-          bytes += chunk.length;
-        });
+        // ★ ここが決定的修正
+        const nodeStream = Readable.fromWeb(response.body);
+        archive.append(nodeStream, { name });
 
-        const pass = new PassThrough();
-        archive.append(pass, { name });
-
-        response.body.pipe(pass);
-        await finished(pass);
-
-        console.log(`[ZIP] fetch end`, name, "bytes:", bytes);
+        console.log("[ZIP] stream appended", name);
       });
     }
 
