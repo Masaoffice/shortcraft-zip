@@ -36,6 +36,7 @@ app.post("/api/create-zip", async (req, res) => {
   }
 
   const zipName = sanitize(zip_name || "download.zip");
+  console.log("[ZIP] start", zipName, "files:", files.length);
 
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
@@ -47,9 +48,10 @@ app.post("/api/create-zip", async (req, res) => {
     forceZip64: true,
   });
 
-  archive.on("error", (err) => {
-    console.error("[zip error]", err);
-    res.destroy(err);
+  archive.on("warning", (e) => console.warn("[ZIP warning]", e.message));
+  archive.on("error", (e) => {
+    console.error("[ZIP error]", e);
+    res.destroy(e);
   });
 
   archive.pipe(res);
@@ -61,24 +63,33 @@ app.post("/api/create-zip", async (req, res) => {
       const f = files[i];
       await limit(async () => {
         const name = sanitize(f.zip_path || `file_${i + 1}`);
+        console.log(`[ZIP] fetch start`, name);
 
         const response = await fetch(f.url, { dispatcher: agent });
         if (!response.ok || !response.body) {
           throw new Error(`fetch_failed_${name}`);
         }
 
-        // ★ 重要：中継ストリーム
+        let bytes = 0;
+        response.body.on("data", (chunk) => {
+          bytes += chunk.length;
+        });
+
         const pass = new PassThrough();
         archive.append(pass, { name });
 
         response.body.pipe(pass);
-        await finished(pass); // ★ 完全に流れ切るまで待つ
+        await finished(pass);
+
+        console.log(`[ZIP] fetch end`, name, "bytes:", bytes);
       });
     }
 
-    await archive.finalize(); // ★ 全部終わってから
+    console.log("[ZIP] finalize start");
+    await archive.finalize();
+    console.log("[ZIP] finalize done");
   } catch (err) {
-    console.error("[zip fatal]", err);
+    console.error("[ZIP fatal]", err);
     res.destroy(err);
   }
 });
