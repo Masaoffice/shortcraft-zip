@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import archiver from "archiver";
-import pLimit from "p-limit";
 import { Agent, fetch } from "undici";
 import { Readable } from "stream";
 
@@ -50,31 +49,46 @@ app.post("/api/create-zip", async (req, res) => {
   archive.on("warning", (e) => console.warn("[ZIP warning]", e.message));
   archive.on("error", (e) => {
     console.error("[ZIP error]", e);
-    res.destroy(e);
+    try {
+      archive.finalize();
+    } catch {}
+    res.end();
+  });
+
+  res.on("close", () => {
+    console.warn("[ZIP] client closed connection");
+    try {
+      archive.abort();
+    } catch {}
   });
 
   archive.pipe(res);
 
-  const limit = pLimit(1);
-
   try {
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
-      await limit(async () => {
-        const name = sanitize(f.zip_path || `file_${i + 1}`);
-        console.log("[ZIP] fetch start", name);
+      const name = sanitize(f.zip_path || `file_${i + 1}`);
+      console.log("[ZIP] fetch start", name);
 
-        const response = await fetch(f.url, { dispatcher: agent });
-        if (!response.ok || !response.body) {
-          throw new Error(`fetch_failed_${name}`);
-        }
+      const response = await fetch(f.url, { dispatcher: agent });
+      if (!response.ok || !response.body) {
+        console.warn("[ZIP] fetch failed", name);
+        continue;
+      }
 
-        // ★ ここが決定的修正
-        const nodeStream = Readable.fromWeb(response.body);
-        archive.append(nodeStream, { name });
+      // ★ 完全に Node Stream に変換
+      const nodeStream = Readable.fromWeb(response.body);
 
-        console.log("[ZIP] stream appended", name);
+      // ★ 1ファイルずつ確実に append
+      archive.append(nodeStream, { name });
+
+      // ★ ここで backpressure を待つ
+      await new Promise((resolve, reject) => {
+        nodeStream.on("end", resolve);
+        nodeStream.on("error", reject);
       });
+
+      console.log("[ZIP] appended", name);
     }
 
     console.log("[ZIP] finalize start");
@@ -82,7 +96,10 @@ app.post("/api/create-zip", async (req, res) => {
     console.log("[ZIP] finalize done");
   } catch (err) {
     console.error("[ZIP fatal]", err);
-    res.destroy(err);
+    try {
+      archive.finalize();
+    } catch {}
+    res.end();
   }
 });
 
