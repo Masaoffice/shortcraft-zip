@@ -3,20 +3,15 @@ import cors from "cors";
 import archiver from "archiver";
 import pLimit from "p-limit";
 import { Agent, fetch } from "undici";
+import { PassThrough } from "stream";
+import { finished } from "stream/promises";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/**
- * CORS
- * shortcraft.jp からのアクセスを明示的に許可
- */
 app.use(
   cors({
-    origin: [
-      "https://shortcraft.jp",
-      "https://www.shortcraft.jp",
-    ],
+    origin: ["https://shortcraft.jp", "https://www.shortcraft.jp"],
     methods: ["POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   })
@@ -24,9 +19,6 @@ app.use(
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
-/**
- * HTTP Agent
- */
 const agent = new Agent({
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 60_000,
@@ -34,18 +26,11 @@ const agent = new Agent({
   bodyTimeout: 0,
 });
 
-/**
- * util
- */
 const sanitize = (name = "file") =>
   name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_");
 
-/**
- * main
- */
 app.post("/api/create-zip", async (req, res) => {
   const { zip_name, files } = req.body || {};
-
   if (!Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ error: "no_files" });
   }
@@ -53,22 +38,13 @@ app.post("/api/create-zip", async (req, res) => {
   const zipName = sanitize(zip_name || "download.zip");
 
   res.setHeader("Content-Type", "application/zip");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${zipName}"`
-  );
+  res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
   res.setHeader("Cache-Control", "no-store");
-
-  // ★ 重要：即レスポンス開始
   res.flushHeaders();
 
   const archive = archiver("zip", {
     zlib: { level: 0 },
     forceZip64: true,
-  });
-
-  archive.on("warning", (err) => {
-    console.warn("[zip warning]", err.message);
   });
 
   archive.on("error", (err) => {
@@ -78,29 +54,29 @@ app.post("/api/create-zip", async (req, res) => {
 
   archive.pipe(res);
 
-  const limit = pLimit(1); // 安定優先
+  const limit = pLimit(1);
 
   try {
-    await Promise.all(
-      files.map((f, idx) =>
-        limit(async () => {
-          const name = sanitize(f.zip_path || `file_${idx + 1}`);
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      await limit(async () => {
+        const name = sanitize(f.zip_path || `file_${i + 1}`);
 
-          const response = await fetch(f.url, {
-            dispatcher: agent,
-          });
+        const response = await fetch(f.url, { dispatcher: agent });
+        if (!response.ok || !response.body) {
+          throw new Error(`fetch_failed_${name}`);
+        }
 
-          if (!response.ok || !response.body) {
-            throw new Error(`fetch_failed_${name}`);
-          }
+        // ★ 重要：中継ストリーム
+        const pass = new PassThrough();
+        archive.append(pass, { name });
 
-          // ★ DLしながら即ZIPへ流す（/tmp 不使用）
-          archive.append(response.body, { name });
-        })
-      )
-    );
+        response.body.pipe(pass);
+        await finished(pass); // ★ 完全に流れ切るまで待つ
+      });
+    }
 
-    await archive.finalize();
+    await archive.finalize(); // ★ 全部終わってから
   } catch (err) {
     console.error("[zip fatal]", err);
     res.destroy(err);
