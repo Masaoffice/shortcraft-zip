@@ -12,32 +12,60 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const TEMP_DIR = "/tmp";
 
+/**
+ * ===== CORS 設定（本番対応）=====
+ * 明示的に shortcraft.jp を許可
+ */
+const ALLOWED_ORIGINS = [
+  "https://shortcraft.jp",
+  "https://www.shortcraft.jp",
+];
+
 app.use(
   cors({
-    origin: (_origin, cb) => cb(null, true),
+    origin: (origin, cb) => {
+      // サーバー間通信 / curl / health check
+      if (!origin) return cb(null, true);
+
+      if (ALLOWED_ORIGINS.includes(origin)) {
+        return cb(null, true);
+      }
+
+      return cb(new Error(`CORS blocked: ${origin}`), false);
+    },
     methods: ["POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   })
 );
+
 app.options("*", cors());
 app.use(express.json());
 
 const sanitize = (name) =>
   name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
 
+/**
+ * ===== HTTP Agent =====
+ * 大容量ダウンロード安定化
+ */
 const agent = new Agent({
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 60_000,
   connectTimeout: 30_000,
-  bodyTimeout: 0,
+  bodyTimeout: 0, // Cloud Run timeout に委ねる
 });
 
 const downloadToTemp = async (url, destPath, ms = 300_000) => {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
   try {
-    const res = await fetch(url, { signal: controller.signal, dispatcher: agent });
-    if (!res.ok || !res.body) throw new Error(`fetch_failed_${res.status}`);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      dispatcher: agent,
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(`fetch_failed_${res.status}`);
+    }
     const fileStream = fs.createWriteStream(destPath);
     await pipeline(res.body, fileStream);
   } finally {
@@ -53,6 +81,8 @@ app.post("/api/create-zip", async (req, res) => {
 
   const zipName = sanitize(zip_name || "download.zip");
   const allowPartial = options?.allowPartial !== false;
+
+  // 並列は 1 固定（安定性優先）
   const limit = pLimit(1);
 
   const zipId = randomUUID();
@@ -61,7 +91,7 @@ app.post("/api/create-zip", async (req, res) => {
   console.log(`[zip] build start name=${zipName} files=${files.length}`);
 
   const archive = archiver("zip", {
-    zlib: { level: 0 },
+    zlib: { level: 0 }, // 圧縮なし（動画向け）
     forceZip64: true,
   });
 
@@ -75,7 +105,7 @@ app.post("/api/create-zip", async (req, res) => {
     await Promise.all(
       files.map((f, idx) =>
         limit(async () => {
-          const zipEntryName = sanitize(f.zip_path || `video_${idx + 1}.bin`);
+          const entryName = sanitize(f.zip_path || `video_${idx + 1}.bin`);
           const tempFile = path.join(
             TEMP_DIR,
             `src_${Date.now()}_${idx}_${Math.random().toString(36).slice(2)}.tmp`
@@ -85,22 +115,29 @@ app.post("/api/create-zip", async (req, res) => {
           const maxRetry = 3;
           for (let attempt = 1; attempt <= maxRetry; attempt++) {
             try {
-              console.log(`[zip] download start ${zipEntryName} attempt=${attempt}`);
+              console.log(
+                `[zip] download start ${entryName} attempt=${attempt}`
+              );
               await downloadToTemp(f.url, tempFile);
-              archive.file(tempFile, { name: zipEntryName });
-              console.log(`[zip] registered ${zipEntryName}`);
+              archive.file(tempFile, { name: entryName });
+              console.log(`[zip] registered ${entryName}`);
               return;
             } catch (e) {
-              console.warn(`[zip] download error ${zipEntryName} attempt=${attempt}`, e.message);
+              console.warn(
+                `[zip] download error ${entryName} attempt=${attempt}`,
+                e.message
+              );
               if (attempt === maxRetry) {
-                failed.push({ zip_path: zipEntryName, reason: e.message });
+                failed.push({ zip_path: entryName, reason: e.message });
                 if (!allowPartial) throw e;
                 archive.append(
-                  `Error downloading ${zipEntryName}: ${e.message}`,
-                  { name: `${zipEntryName}.error.txt` }
+                  `Error downloading ${entryName}: ${e.message}`,
+                  { name: `${entryName}.error.txt` }
                 );
               } else {
-                await new Promise((r) => setTimeout(r, 2000 * attempt));
+                await new Promise((r) =>
+                  setTimeout(r, 2000 * attempt)
+                );
               }
             }
           }
@@ -114,11 +151,16 @@ app.post("/api/create-zip", async (req, res) => {
     const stat = await fs.promises.stat(zipPath);
 
     console.log(
-      `[zip] build done status=${failed.length ? "partial_failed" : "completed"} size=${stat.size}`
+      `[zip] build done status=${
+        failed.length ? "partial_failed" : "completed"
+      } size=${stat.size}`
     );
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${zipName}"`
+    );
     res.setHeader("Content-Length", stat.size);
 
     const zipStream = fs.createReadStream(zipPath);
